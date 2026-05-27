@@ -507,11 +507,14 @@ def prepare_invoice_df(
 
 def compare_pl_invoice(pl_df: pd.DataFrame, inv_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    max_len = max(len(pl_df), len(inv_df))
+    len_pl = len(pl_df)
+    len_inv = len(inv_df)
+
+    max_len = max(len_pl, len_inv)
 
     for index in range(max_len):
-        pl_row = pl_df.iloc[index] if index < len(pl_df) else None
-        inv_row = inv_df.iloc[index] if index < len(inv_df) else None
+        pl_row = pl_df.iloc[index] if index < len_pl else None
+        inv_row = inv_df.iloc[index] if index < len_inv else None
 
         if pl_row is None:
             status = 'ROW_MISSING_IN_PL'
@@ -549,6 +552,22 @@ def compare_pl_invoice(pl_df: pd.DataFrame, inv_df: pd.DataFrame) -> pd.DataFram
         )
 
     return pd.DataFrame(rows)
+
+
+def build_pl_invoice_not_run_df(note: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                'row_no': None,
+                'pl_product_code': None,
+                'inv_product_code': None,
+                'pl_qty_shipped': None,
+                'inv_qty_shipped': None,
+                'status': 'NOT_RUN',
+                'note': note,
+            }
+        ]
+    )
 
 
 def build_packing_summary(pl_df: pd.DataFrame) -> pd.DataFrame:
@@ -704,6 +723,27 @@ def validate_packing_vs_co(
     return pd.DataFrame(rows)
 
 
+def build_packing_vs_co_not_run_df(note: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                'product_code': None,
+                'packing_list_item_no': None,
+                'packing_total_qty': None,
+                'co_item_no': None,
+                'co_quantity_pieces': None,
+                'qty_diff': None,
+                'packing_total_net_weight': None,
+                'co_net_weight_kgs': None,
+                'weight_diff': None,
+                'co_description': None,
+                'status': 'NOT_RUN',
+                'note': note,
+            }
+        ]
+    )
+
+
 def build_package_check_df(packing_packages, co_total_packages) -> pd.DataFrame:
     if packing_packages is None:
         status = 'PACKING_PACKAGES_NOT_FOUND'
@@ -730,6 +770,41 @@ def build_package_check_df(packing_packages, co_total_packages) -> pd.DataFrame:
     )
 
 
+def build_package_check_not_run_df(note: str) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                'packing_packages': None,
+                'co_total_packages': None,
+                'status': 'NOT_RUN',
+                'note': note,
+            }
+        ]
+    )
+
+
+def build_empty_co_df() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            'item_no',
+            'raw_item_no',
+            'item_no_repaired',
+            'raw_block',
+            'description',
+            'hs_code',
+            'quantity_pieces',
+            'net_weight_kgs',
+        ]
+    )
+
+
+def count_validation_errors(df: pd.DataFrame) -> int:
+    if df.empty or 'status' not in df.columns:
+        return 0
+
+    return int((~df['status'].isin(['PASS', 'NOT_RUN'])).sum())
+
+
 def build_summary(
     pl_df,
     inv_df,
@@ -737,10 +812,13 @@ def build_summary(
     pl_vs_invoice_df,
     packing_vs_co_df,
     package_check_df,
+    missing_files: list[str] | None = None,
 ):
-    pl_invoice_errors = int((pl_vs_invoice_df['status'] != 'PASS').sum())
-    packing_co_errors = int((packing_vs_co_df['status'] != 'PASS').sum())
-    package_errors = int((package_check_df['status'] != 'PASS').sum())
+    missing_files = missing_files or []
+
+    pl_invoice_errors = count_validation_errors(pl_vs_invoice_df)
+    packing_co_errors = count_validation_errors(packing_vs_co_df)
+    package_errors = count_validation_errors(package_check_df)
 
     final_result = (
         'PASS'
@@ -750,17 +828,62 @@ def build_summary(
         else 'FAIL'
     )
 
-    return pd.DataFrame(
-        [
-            {'metric': 'Packing rows', 'value': str(len(pl_df))},
-            {'metric': 'Invoice rows', 'value': str(len(inv_df))},
-            {'metric': 'CO rows', 'value': str(len(co_df))},
-            {'metric': 'PL vs Invoice errors', 'value': str(pl_invoice_errors)},
-            {'metric': 'Packing vs CO errors', 'value': str(packing_co_errors)},
-            {'metric': 'Package check errors', 'value': str(package_errors)},
-            {'metric': 'Final result', 'value': final_result},
-        ]
-    )
+    missing_file_notes = {
+        'Packing List': 'No Packing List available.',
+        'Invoice': 'No Invoice available.',
+        'CO': 'No CO available.',
+    }
+
+    def note_for(file_name: str) -> str:
+        return missing_file_notes[file_name] if file_name in missing_files else ''
+
+    rows = [
+        {
+            'metric': 'Packing rows',
+            'value': str(len(pl_df)),
+            'note': note_for('Packing List'),
+        },
+        {
+            'metric': 'Invoice rows',
+            'value': str(len(inv_df)),
+            'note': note_for('Invoice'),
+        },
+        {
+            'metric': 'CO rows',
+            'value': str(len(co_df)),
+            'note': note_for('CO'),
+        },
+        {
+            'metric': 'PL vs Invoice errors',
+            'value': str(pl_invoice_errors),
+            'note': (
+                'Not run because Invoice is not available.'
+                if 'Invoice' in missing_files
+                else ''
+            ),
+        },
+        {
+            'metric': 'Packing vs CO errors',
+            'value': str(packing_co_errors),
+            'note': (
+                'Not run because CO is not available.'
+                if 'CO' in missing_files
+                else ''
+            ),
+        },
+        {
+            'metric': 'Package check errors',
+            'value': str(package_errors),
+            'note': (
+                'Not run because CO is not available.'
+                if 'CO' in missing_files
+                else ''
+            ),
+        },
+        {'metric': 'Final result', 'value': final_result, 'note': ''},
+    ]
+
+    return pd.DataFrame(rows)
 
 
 def write_report(
@@ -864,7 +987,9 @@ weight_tolerance = st.number_input(
     step=0.01,
 )
 
-files_ready = all([packing_file, invoice_file, co_pdf_file])
+files_ready = packing_file is not None and (
+    invoice_file is not None or co_pdf_file is not None
+)
 
 validate_clicked = st.button(
     'Validate',
@@ -873,23 +998,16 @@ validate_clicked = st.button(
 )
 
 if not files_ready:
-    st.info('Upload the Packing List, Commercial Invoice, and CO PDF to enable validation.')
+    st.info(
+        'Upload the Packing List and at least one comparison file: '
+        'Commercial Invoice or CO PDF.'
+    )
 
 if validate_clicked:
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
-        tmp.write(co_pdf_file.read())
-        co_pdf_path = tmp.name
-
     with st.spinner('Reading files and validating...'):
         pl_decimal_separator = DECIMAL_SEPARATOR_OPTIONS[pl_decimal_separator_label]
         inv_decimal_separator = DECIMAL_SEPARATOR_OPTIONS[inv_decimal_separator_label]
         co_decimal_separator = DECIMAL_SEPARATOR_OPTIONS[co_decimal_separator_label]
-
-        co_text = get_pdf_text(co_pdf_path)
-        co_df = extract_co_items(
-            co_text,
-            decimal_separator=co_decimal_separator,
-        )
 
         pl_df, packing_packages = prepare_packing_df(
             packing_file,
@@ -899,28 +1017,65 @@ if validate_clicked:
             decimal_separator=pl_decimal_separator,
         )
 
-        inv_df = prepare_invoice_df(
-            invoice_file,
-            product_code_header=inv_product_code_header,
-            qty_shipped_header=inv_qty_shipped_header,
-            decimal_separator=inv_decimal_separator,
-        )
+        missing_files = []
 
-        co_total_packages = extract_co_total_packages(co_text)
+        if invoice_file is None:
+            missing_files.append('Invoice')
+            inv_df = pd.DataFrame(
+                columns=[
+                    'source_row_no',
+                    'product_code',
+                    'qty_shipped',
+                ]
+            )
+            pl_vs_invoice_df = build_pl_invoice_not_run_df(
+                'No Invoice available. PL vs Invoice validation was not run.'
+            )
+        else:
+            inv_df = prepare_invoice_df(
+                invoice_file,
+                product_code_header=inv_product_code_header,
+                qty_shipped_header=inv_qty_shipped_header,
+                decimal_separator=inv_decimal_separator,
+            )
+            pl_vs_invoice_df = compare_pl_invoice(pl_df, inv_df)
 
-        pl_vs_invoice_df = compare_pl_invoice(pl_df, inv_df)
+        if co_pdf_file is None:
+            missing_files.append('CO')
+            co_text = ''
+            co_df = build_empty_co_df()
+            co_total_packages = None
+            packing_vs_co_df = build_packing_vs_co_not_run_df(
+                'No CO available. Packing vs CO validation was not run.'
+            )
+            package_check_df = build_package_check_not_run_df(
+                'No CO available. Package check was not run.'
+            )
+        else:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+                tmp.write(co_pdf_file.read())
+                co_pdf_path = tmp.name
+
+            co_text = get_pdf_text(co_pdf_path)
+            co_df = extract_co_items(
+                co_text,
+                decimal_separator=co_decimal_separator,
+            )
+            co_total_packages = extract_co_total_packages(co_text)
+
         packing_summary_df = build_packing_summary(pl_df)
 
-        packing_vs_co_df = validate_packing_vs_co(
-            packing_summary_df,
-            co_df,
-            weight_tolerance=weight_tolerance,
-        )
+        if co_pdf_file is not None:
+            packing_vs_co_df = validate_packing_vs_co(
+                packing_summary_df,
+                co_df,
+                weight_tolerance=weight_tolerance,
+            )
 
-        package_check_df = build_package_check_df(
-            packing_packages,
-            co_total_packages,
-        )
+            package_check_df = build_package_check_df(
+                packing_packages,
+                co_total_packages,
+            )
 
         summary_df = build_summary(
             pl_df,
@@ -929,6 +1084,7 @@ if validate_clicked:
             pl_vs_invoice_df,
             packing_vs_co_df,
             package_check_df,
+            missing_files=missing_files,
         )
 
         output_path = Path(tempfile.gettempdir()) / 'co_validation_result.xlsx'
