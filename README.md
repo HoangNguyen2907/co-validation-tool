@@ -8,7 +8,7 @@ Streamlit app for validating Packing List, Commercial Invoice, and CO PDF data.
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-streamlit run co-validator.py
+streamlit run co_validator.py
 ```
 
 If OCR is needed locally, install the Tesseract command-line tool too:

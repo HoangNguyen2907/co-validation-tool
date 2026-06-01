@@ -1,7 +1,7 @@
 import io
+from numbers import Number
 import re
 import tempfile
-from numbers import Number
 from pathlib import Path
 
 import fitz
@@ -323,11 +323,14 @@ def read_table_from_excel(file, required_columns: list[str]) -> pd.DataFrame:
     if header_index is None:
         raise ValueError(f'Cannot find header row: {required_columns}')
 
-    file.seek(0)
-    df = pd.read_excel(file, header=header_index)
+    header_values = raw.iloc[header_index]
+    df = raw.iloc[header_index + 1:].copy()
 
     df = df.dropna(how='all')
-    df.columns = [str(col).strip() for col in df.columns]
+    df.columns = [
+        str(col).strip() if pd.notna(col) else f'Unnamed: {index}'
+        for index, col in enumerate(header_values)
+    ]
 
     return df
 
@@ -347,6 +350,22 @@ def pick_column(df: pd.DataFrame, candidates: list[str]) -> str:
     raise ValueError(f'Missing column. Candidates: {candidates}')
 
 
+def pick_packing_item_no_column(df: pd.DataFrame, product_col: str) -> str | None:
+    product_index = list(df.columns).index(product_col)
+    candidate_columns = list(df.columns[:product_index])
+
+    for column in candidate_columns:
+        numeric_values = df[column].apply(to_number).dropna()
+
+        if numeric_values.empty:
+            continue
+
+        if numeric_values.apply(float.is_integer).all():
+            return column
+
+    return None
+
+
 def is_product_row(
     row,
     product_col: str,
@@ -355,8 +374,8 @@ def is_product_row(
     decimal_separator: str = 'auto',
 ) -> bool:
     product_code = str(row.get(product_col, '')).strip()
-    qty = to_number(row.get(qty_col), decimal_separator=decimal_separator)
-
+    raw_qty_col = row.get(qty_col)
+    qty = to_number(raw_qty_col, decimal_separator=decimal_separator)
     if (
         product_code == ''
         or product_code.lower() == 'nan'
@@ -424,6 +443,7 @@ def prepare_packing_df(
     product_col = pick_column(df, [product_code_header])
     qty_col = pick_column(df, [qty_shipped_header])
     net_weight_col = pick_column(df, [net_weight_header])
+    item_no_col = pick_packing_item_no_column(df, product_col)
 
     df = df[
         df.apply(
@@ -438,9 +458,17 @@ def prepare_packing_df(
         )
     ]
 
+    packing_item_no = (
+        df[item_no_col].apply(lambda value: to_int(value))
+        if item_no_col is not None
+        else pd.Series([None] * len(df), index=df.index)
+    )
+
     result = pd.DataFrame(
         {
+            'product_row_no': range(1, len(df) + 1),
             'source_row_no': df.index + 1,
+            'packing_list_item_no': packing_item_no,
             'product_code': df[product_col].astype(str).str.strip(),
             'qty_shipped': df[qty_col].apply(
                 lambda value: to_int(
@@ -542,6 +570,11 @@ def compare_pl_invoice(pl_df: pd.DataFrame, inv_df: pd.DataFrame) -> pd.DataFram
         rows.append(
             {
                 'row_no': index + 1,
+                'packing_list_item_no': (
+                    None
+                    if pl_row is None
+                    else pl_row.get('packing_list_item_no')
+                ),
                 'pl_product_code': None if pl_row is None else pl_row['product_code'],
                 'inv_product_code': None if inv_row is None else inv_row['product_code'],
                 'pl_qty_shipped': None if pl_row is None else pl_row['qty_shipped'],
@@ -559,6 +592,7 @@ def build_pl_invoice_not_run_df(note: str) -> pd.DataFrame:
         [
             {
                 'row_no': None,
+                'packing_list_item_no': None,
                 'pl_product_code': None,
                 'inv_product_code': None,
                 'pl_qty_shipped': None,
@@ -578,7 +612,21 @@ def build_packing_summary(pl_df: pd.DataFrame) -> pd.DataFrame:
             total_shipped_qty=('qty_shipped', 'sum'),
             total_net_weight=('net_weight', 'sum'),
             row_count=('product_code', 'size'),
-            source_rows=('source_row_no', lambda values: ', '.join(map(str, values))),
+            product_row_nos=(
+                'product_row_no',
+                lambda values: ', '.join(map(str, values)),
+            ),
+            packing_list_item_nos=(
+                'packing_list_item_no',
+                lambda values: ', '.join(
+                    str(int(value)) if pd.notna(value) else ''
+                    for value in values
+                ),
+            ),
+            excel_file_row_nos=(
+                'source_row_no',
+                lambda values: ', '.join(map(str, values)),
+            ),
         )
     )
 
@@ -621,9 +669,10 @@ def validate_packing_vs_co(
             rows.append(
                 {
                     'product_code': product_code,
-                    'packing_list_item_no': packing_row['source_rows'],
-                    'packing_total_qty': packing_row['total_shipped_qty'],
                     'co_item_no': None,
+                    'product_row_no': packing_row['product_row_nos'],
+                    'packing_list_item_no': packing_row['packing_list_item_nos'],
+                    'packing_total_qty': packing_row['total_shipped_qty'],
                     'co_quantity_pieces': None,
                     'qty_diff': None,
                     'packing_total_net_weight': packing_row['total_net_weight'],
@@ -640,11 +689,12 @@ def validate_packing_vs_co(
             rows.append(
                 {
                     'product_code': product_code,
-                    'packing_list_item_no': packing_row['source_rows'],
                     'co_item_no': ', '.join(
                         str(row.get('item_no', ''))
                         for row in matched_co_rows
                     ),
+                    'product_row_no': packing_row['product_row_nos'],
+                    'packing_list_item_no': packing_row['packing_list_item_nos'],
                     'packing_total_qty': packing_row['total_shipped_qty'],
                     'co_quantity_pieces': None,
                     'qty_diff': None,
@@ -669,9 +719,10 @@ def validate_packing_vs_co(
             rows.append(
                 {
                     'product_code': product_code,
-                    'packing_list_item_no': packing_row['source_rows'],
-                    'packing_total_qty': packing_row['total_shipped_qty'],
                     'co_item_no': co_row.get('item_no'),
+                    'product_row_no': packing_row['product_row_nos'],
+                    'packing_list_item_no': packing_row['packing_list_item_nos'],
+                    'packing_total_qty': packing_row['total_shipped_qty'],
                     'co_quantity_pieces': co_qty,
                     'qty_diff': None,
                     'packing_total_net_weight': packing_row['total_net_weight'],
@@ -706,9 +757,10 @@ def validate_packing_vs_co(
         rows.append(
             {
                 'product_code': product_code,
-                'packing_list_item_no': packing_row['source_rows'],
-                'packing_total_qty': packing_row['total_shipped_qty'],
                 'co_item_no': co_row.get('item_no'),
+                'product_row_no': packing_row['product_row_nos'],
+                'packing_list_item_no': packing_row['packing_list_item_nos'],
+                'packing_total_qty': packing_row['total_shipped_qty'],
                 'co_quantity_pieces': co_qty,
                 'qty_diff': qty_diff,
                 'packing_total_net_weight': packing_row['total_net_weight'],
@@ -728,9 +780,10 @@ def build_packing_vs_co_not_run_df(note: str) -> pd.DataFrame:
         [
             {
                 'product_code': None,
+                'co_item_no': None,
+                'product_row_no': None,
                 'packing_list_item_no': None,
                 'packing_total_qty': None,
-                'co_item_no': None,
                 'co_quantity_pieces': None,
                 'qty_diff': None,
                 'packing_total_net_weight': None,
@@ -1107,8 +1160,7 @@ if validate_clicked:
     if final_result == 'PASS':
         st.success('Validation passed')
     else:
-        st.error('Validation failed')
-
+        st.error('Validation failed') 
     st.subheader('Summary')
     st.dataframe(summary_df, hide_index=True, width='stretch')
 
