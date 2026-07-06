@@ -282,6 +282,16 @@ def prepare_invoice_df(
 
     product_col = pick_column(df, [product_code_header])
     qty_col = pick_column(df, [qty_shipped_header])
+    item_no_col = pick_packing_item_no_column(df, product_col)
+
+    # 1. Print danh sách các headers (tên cột)
+    print("--- HEADERS OF DF ---")
+    print(df.columns.tolist())
+    print("-" * 30)
+
+    print("--- ĐỐI CHIẾU PRODUCT CODE VÀ QTY SHIPPED ---")
+    print(df[[product_col, qty_col]].head(10))
+    print("-" * 30)
 
     df = df[
         df.apply(
@@ -295,9 +305,16 @@ def prepare_invoice_df(
         )
     ]
 
+    inv_item_no = (
+        df[item_no_col].apply(lambda value: to_int(value))
+        if item_no_col is not None
+        else pd.Series([None] * len(df), index=df.index)
+    )
+
     result = pd.DataFrame(
         {
             'source_row_no': df[INTERNAL_SOURCE_ROW_NO],
+            'item_no': inv_item_no,
             'product_code': df[product_col].astype(str).str.strip(),
             'qty_shipped': df[qty_col].apply(
                 lambda value: to_int(
@@ -313,3 +330,78 @@ def prepare_invoice_df(
     }
 
     return result.reset_index(drop=True), invoice_context
+
+
+# InvoiceSummaryDataRow represents aggregated invoice information for a single product_code.
+InvoiceSummaryDataRow = dict  # keys: product_code, total_qty_shipped, sources (dict mapping filename -> {"item_nos": list, "source_row_nos": list})
+
+# InvoiceMap maps product_code to InvoiceSummaryDataRow
+InvoiceMap = dict
+
+
+def prepare_invoice_df_multi(
+    files: list[tuple[str, object]],
+    product_code_header: str,
+    qty_shipped_header: str,
+    decimal_separator: str = 'auto',
+) -> tuple[InvoiceMap, list[dict]]:
+    """Prepare an InvoiceMap and list of invoice contexts from multiple files.
+
+    Args:
+        files: list of (filename, file_obj) tuples.
+        product_code_header: column header for product code.
+        qty_shipped_header: column header for qty shipped.
+        decimal_separator: decimal separator option.
+
+    Returns:
+        A tuple of:
+          - InvoiceMap: dict mapping product_code (upper-stripped) to a single
+            InvoiceSummaryDataRow dict.
+          - invoice_contexts: list of per-file context dicts (with 'raw_df' and
+            'source_file' keys), one per uploaded file.
+    """
+    invoice_map: InvoiceMap = {}
+    invoice_contexts: list[dict] = []
+
+    for filename, file_obj in files:
+        print('filename', filename)
+        inv_df, ctx = prepare_invoice_df(
+            file_obj,
+            product_code_header=product_code_header,
+            qty_shipped_header=qty_shipped_header,
+            decimal_separator=decimal_separator,
+        )
+        ctx['source_file'] = filename
+        invoice_contexts.append(ctx)
+
+        for _, row in inv_df.iterrows():
+            product_code = str(row['product_code']).strip().upper()
+            qty = row['qty_shipped']
+            item_no = row.get('item_no')
+            row_no = row['source_row_no']
+
+            if product_code not in invoice_map:
+                invoice_map[product_code] = {
+                    'product_code': product_code,
+                    'total_qty_shipped': 0,
+                    'sources': {}
+                }
+
+            summary = invoice_map[product_code]
+            if qty is not None:
+                summary['total_qty_shipped'] += qty
+
+            sources = summary['sources']
+            if filename not in sources:
+                sources[filename] = {
+                    'item_nos': [],
+                    'source_row_nos': []
+                }
+
+            file_data = sources[filename]
+            if item_no is not None and pd.notna(item_no):
+                file_data['item_nos'].append(int(item_no))
+            if row_no is not None and pd.notna(row_no):
+                file_data['source_row_nos'].append(int(row_no))
+
+    return invoice_map, invoice_contexts

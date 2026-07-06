@@ -121,6 +121,7 @@ def build_empty_co_df() -> pd.DataFrame:
             'hs_code',
             'quantity_pieces',
             'net_weight_kgs',
+            'source_file',
         ]
     )
 
@@ -134,14 +135,31 @@ def count_validation_errors(df: pd.DataFrame) -> int:
 
 def build_summary(
     pl_df,
-    inv_df,
+    inv_df_or_count,
     co_df,
     pl_vs_invoice_df,
     packing_vs_co_df,
     package_check_df,
     missing_files: list[str] | None = None,
 ):
+    """Build the summary DataFrame.
+
+    Args:
+        pl_df: Packing List DataFrame.
+        inv_df_or_count: Either a DataFrame (backward compat) or an integer
+            representing the total invoice row count from all files.
+        co_df: CO items DataFrame (may contain rows from multiple files).
+        pl_vs_invoice_df: PL vs Invoice validation result.
+        packing_vs_co_df: Packing vs CO validation result.
+        package_check_df: Package check result.
+        missing_files: list of file type names that were not provided.
+    """
     missing_files = missing_files or []
+
+    if isinstance(inv_df_or_count, int):
+        inv_row_count = inv_df_or_count
+    else:
+        inv_row_count = len(inv_df_or_count)
 
     pl_invoice_errors = count_validation_errors(pl_vs_invoice_df)
     packing_co_errors = count_validation_errors(packing_vs_co_df)
@@ -172,7 +190,7 @@ def build_summary(
         },
         {
             'metric': 'Invoice rows',
-            'value': str(len(inv_df)),
+            'value': str(inv_row_count),
             'note': note_for('Invoice'),
         },
         {
@@ -225,7 +243,6 @@ def write_report(
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
         summary_df.to_excel(writer, sheet_name='Summary', index=False)
         pl_vs_invoice_df.to_excel(writer, sheet_name='PL_vs_Invoice', index=False)
-        packing_summary_df.to_excel(writer, sheet_name='Packing_Summary', index=False)
         packing_vs_co_df.to_excel(writer, sheet_name='Packing_vs_CO', index=False)
         package_check_df.to_excel(writer, sheet_name='Package_Check', index=False)
         co_df.to_excel(writer, sheet_name='CO', index=False)

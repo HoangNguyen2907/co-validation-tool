@@ -330,20 +330,78 @@ def build_packing_audit_targets(
     return targets
 
 
+def parse_grouped_source_row_nos(value: str) -> list[tuple[int, str | None]]:
+    """Parse a grouped source row numbers string.
+    
+    Example input: "30, 31 (invoice_1.xlsx); 45 (invoice_2.xlsx)" or "30"
+    Returns: a list of (row_no, filename) tuples.
+    """
+    if not value or pd.isna(value):
+        return []
+    
+    results = []
+    # Split by semicolon to separate files
+    parts = str(value).split(';')
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        # Check if there is filename inside parentheses
+        match = re.search(r'\(([^)]+)\)', part)
+        filename = match.group(1).strip() if match else None
+        
+        # Clean row number text (remove parentheses and everything inside)
+        row_nos_text = re.sub(r'\([^)]+\)', '', part).strip()
+        
+        # Split row numbers by comma
+        for r_item in row_nos_text.split(','):
+            row_no = to_int(r_item.strip())
+            if row_no is not None:
+                results.append((row_no, filename))
+    return results
+
+
 def build_pl_invoice_review_targets(
     pl_vs_invoice_df: pd.DataFrame,
     packing_context: dict,
-    invoice_context: dict,
+    invoice_context_or_list,
 ) -> list[dict]:
+    """Build AI review targets for the PL vs Invoice validation result.
+
+    Args:
+        pl_vs_invoice_df: Result DataFrame from compare_pl_invoice_summary.
+        packing_context: dict with 'raw_df' key for the Packing List.
+        invoice_context_or_list: Either a single context dict (backward compat,
+            with 'raw_df' key) or a list of context dicts (multi-file), where
+            each dict has 'raw_df' and 'source_file' keys.
+    """
     targets = []
     packing_raw_df = packing_context.get('raw_df', pd.DataFrame())
-    invoice_raw_df = invoice_context.get('raw_df', pd.DataFrame())
     packing_raw_rows_by_source_row_no = build_raw_rows_by_source_row_no(
         packing_raw_df
     )
-    invoice_raw_rows_by_source_row_no = build_raw_rows_by_source_row_no(
-        invoice_raw_df
-    )
+
+    # Build per-file lookup: {source_file → raw_rows_by_source_row_no}
+    if isinstance(invoice_context_or_list, list):
+        invoice_lookup_by_file: dict[str, dict] = {
+            ctx['source_file']: build_raw_rows_by_source_row_no(
+                ctx.get('raw_df', pd.DataFrame())
+            )
+            for ctx in invoice_context_or_list
+            if ctx.get('source_file')
+        }
+        # Fallback lookup merging all files (for rows without source_file info)
+        merged_lookup: dict[int, list[dict]] = {}
+        for per_file_lookup in invoice_lookup_by_file.values():
+            for row_no, rows in per_file_lookup.items():
+                merged_lookup.setdefault(row_no, []).extend(rows)
+    else:
+        # Backward compat: single context dict
+        single_lookup = build_raw_rows_by_source_row_no(
+            invoice_context_or_list.get('raw_df', pd.DataFrame())
+        )
+        invoice_lookup_by_file = {}
+        merged_lookup = single_lookup
 
     for _, row in pl_vs_invoice_df.iterrows():
         status = str(row.get('status') or '')
@@ -356,16 +414,35 @@ def build_pl_invoice_review_targets(
         if row_no is None:
             continue
 
-        pl_source_row_no = to_int(row.get('pl_source_row_no'))
-        inv_source_row_no = to_int(row.get('inv_source_row_no'))
+        # 1. Parse PL rows (simple comma-separated string)
+        pl_row_nos_str = row.get('pkl_source_row_nos') or ''
+        pl_source_row_numbers = parse_source_row_nos(pl_row_nos_str)
         pl_raw_rows = get_raw_rows_from_lookup(
             packing_raw_rows_by_source_row_no,
-            [pl_source_row_no],
+            pl_source_row_numbers,
         )
-        invoice_raw_rows = get_raw_rows_from_lookup(
-            invoice_raw_rows_by_source_row_no,
-            [inv_source_row_no],
-        )
+
+        # 2. Parse Invoice rows using the grouped parser
+        inv_row_nos_str = row.get('inv_source_row_nos') or ''
+        inv_parsed_items = parse_grouped_source_row_nos(inv_row_nos_str)
+
+        invoice_raw_rows = []
+        for inv_row_no, inv_file in inv_parsed_items:
+            # Prefer per-file lookup when source_file is available.
+            if inv_file and inv_file in invoice_lookup_by_file:
+                invoice_raw_rows.extend(
+                    get_raw_rows_from_lookup(
+                        invoice_lookup_by_file[inv_file],
+                        [inv_row_no],
+                    )
+                )
+            else:
+                invoice_raw_rows.extend(
+                    get_raw_rows_from_lookup(
+                        merged_lookup,
+                        [inv_row_no],
+                    )
+                )
 
         append_ai_target(
             targets,
@@ -376,28 +453,28 @@ def build_pl_invoice_review_targets(
                 'source_section': 'PL_vs_Invoice',
                 'source_status': status,
                 'rule_values': {
-                    'pl_product_code': row.get('pl_product_code'),
-                    'invoice_product_code': row.get('inv_product_code'),
-                    'pl_quantity_pieces': row.get('pl_qty_shipped'),
-                    'invoice_quantity_pieces': row.get('inv_qty_shipped'),
+                    'product_code': row.get('product_code'),
+                    'pl_quantity_pieces': row.get('pkl_total_qty'),
+                    'invoice_quantity_pieces': row.get('inv_total_qty'),
                     'note': row.get('note'),
                 },
                 'pl_row': (
-                    None if pl_source_row_no is None else {
-                        'source_row_no': pl_source_row_no,
+                    None if not pl_source_row_numbers else {
+                        'source_row_no': pl_row_nos_str,
                         'parsed': {
-                            'product_code': row.get('pl_product_code'),
-                            'quantity_pieces': row.get('pl_qty_shipped'),
+                            'product_code': row.get('product_code'),
+                            'quantity_pieces': row.get('pkl_total_qty'),
                         },
                         'raw_rows': pl_raw_rows,
                     }
                 ),
                 'invoice_row': (
-                    None if inv_source_row_no is None else {
-                        'source_row_no': inv_source_row_no,
+                    None if not inv_parsed_items else {
+                        'source_row_no': inv_row_nos_str,
+                        'source_file': row.get('inv_source_files'),
                         'parsed': {
-                            'product_code': row.get('inv_product_code'),
-                            'quantity_pieces': row.get('inv_qty_shipped'),
+                            'product_code': row.get('product_code'),
+                            'quantity_pieces': row.get('inv_total_qty'),
                         },
                         'raw_rows': invoice_raw_rows,
                     }
@@ -406,6 +483,8 @@ def build_pl_invoice_review_targets(
         )
 
     return targets
+
+
 
 
 def build_packing_co_review_targets(

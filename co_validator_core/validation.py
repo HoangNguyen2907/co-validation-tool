@@ -1,64 +1,121 @@
 import re
+from copy import deepcopy
 
 import pandas as pd
 
 
-def compare_pl_invoice(pl_df: pd.DataFrame, inv_df: pd.DataFrame) -> pd.DataFrame:
+def format_grouped_sources(sources: dict, key: str) -> str:
+    """Format item numbers or row numbers grouped by source file.
+    
+    Example: "33, 34, 35 (invoice_1.xlsx); 80 (invoice_2.xlsx)"
+    """
+    if not sources:
+        return ''
+    parts = []
+    for filename in sorted(sources.keys()):
+        data = sources[filename]
+        vals = data.get(key, [])
+        clean_vals = sorted(list({str(v) for v in vals if v is not None}))
+        if clean_vals:
+            vals_str = ', '.join(clean_vals)
+            if len(sources) > 1:
+                parts.append(f"{vals_str} ({filename})")
+            else:
+                parts.append(vals_str)
+    return '; '.join(parts)
+
+
+def compare_pl_invoice_summary(
+    pl_df: pd.DataFrame,
+    invoice_map: dict,
+) -> pd.DataFrame:
+    """Compare Packing List summary against Invoice summary map by product_code.
+
+    - Summarizes both PL and Invoice data by product_code.
+    - Compares pl_total_qty vs inv_total_qty.
+    - Formats item_nos, source_files, and source_row_nos.
+    """
+    invoice_map = deepcopy(invoice_map)
+    
+    # 1. Group Packing List data by product_code
+    pkl_grouped = {}
+    for _, row in pl_df.iterrows():
+        prod_code = str(row['product_code']).strip().upper()
+        pkl_grouped.setdefault(prod_code, []).append(row)
+
+    pkl_summaries = {}
+    for prod_code, rows in pkl_grouped.items():
+        total_qty = sum(r['qty_shipped'] for r in rows if r['qty_shipped'] is not None)
+        total_net_w = sum(r['net_weight'] for r in rows if r['net_weight'] is not None)
+        
+        item_nos = ', '.join(sorted(list({
+            str(int(r['packing_list_item_no']))
+            for r in rows
+            if r.get('packing_list_item_no') is not None and pd.notna(r['packing_list_item_no'])
+        })))
+        
+        row_nos = ', '.join(map(str, sorted(list({
+            int(r['source_row_no'])
+            for r in rows
+            if r.get('source_row_no') is not None
+        }))))
+        
+        pkl_summaries[prod_code] = {
+            'product_code': prod_code,
+            'total_qty': total_qty,
+            'total_net_w': total_net_w,
+            'pl_item_nos': item_nos,
+            'pl_source_row_nos': row_nos,
+        }
+
+    # 2. Get the union of product codes from both PL and INV summaries
+    all_product_codes = sorted(list(set(pkl_summaries.keys()) | set(invoice_map.keys())))
+    
     rows = []
-    len_pl = len(pl_df)
-    len_inv = len(inv_df)
-
-    max_len = max(len_pl, len_inv)
-
-    for index in range(max_len):
-        pl_row = pl_df.iloc[index] if index < len_pl else None
-        inv_row = inv_df.iloc[index] if index < len_inv else None
-
-        if pl_row is None:
+    for idx, prod_code in enumerate(all_product_codes):
+        pkl_sum = pkl_summaries.get(prod_code)
+        inv_sum = invoice_map.get(prod_code)
+        
+        if pkl_sum is None:
             status = 'ROW_MISSING_IN_PL'
-            note = 'Invoice has row but Packing List does not.'
-        elif inv_row is None:
-            status = 'ROW_MISSING_IN_INVOICE'
-            note = 'Packing List has row but Invoice does not.'
+            note = 'Product Code exists in Invoice but is missing in Packing List.'
+        elif inv_sum is None:
+            status = 'PRODUCT_MISSING_IN_INVOICE'
+            note = 'Product Code exists in Packing List but is missing in Invoice.'
         else:
-            product_match = pl_row['product_code'] == inv_row['product_code']
-            qty_match = pl_row['qty_shipped'] == inv_row['qty_shipped']
-
-            if product_match and qty_match:
+            if pkl_sum['total_qty'] == inv_sum['total_qty_shipped']:
                 status = 'PASS'
                 note = ''
-            elif not product_match and not qty_match:
-                status = 'PRODUCT_AND_QTY_MISMATCH'
-                note = 'Product Code and Qty Shipped are different.'
-            elif not product_match:
-                status = 'PRODUCT_MISMATCH'
-                note = 'Product Code is different.'
             else:
                 status = 'QTY_MISMATCH'
-                note = 'Qty Shipped is different.'
+                note = f"Total quantity differs: PL={pkl_sum['total_qty']} vs INV={inv_sum['total_qty_shipped']}."
 
-        rows.append(
-            {
-                'row_no': index + 1,
-                'packing_list_item_no': (
-                    None
-                    if pl_row is None
-                    else pl_row.get('packing_list_item_no')
-                ),
-                'pl_source_row_no': (
-                    None if pl_row is None else pl_row.get('source_row_no')
-                ),
-                'inv_source_row_no': (
-                    None if inv_row is None else inv_row.get('source_row_no')
-                ),
-                'pl_product_code': None if pl_row is None else pl_row['product_code'],
-                'inv_product_code': None if inv_row is None else inv_row['product_code'],
-                'pl_qty_shipped': None if pl_row is None else pl_row['qty_shipped'],
-                'inv_qty_shipped': None if inv_row is None else inv_row['qty_shipped'],
-                'status': status,
-                'note': note,
-            }
-        )
+        inv_item_nos = ''
+        inv_source_files = ''
+        inv_source_row_nos = ''
+        inv_total_qty = None
+        
+        if inv_sum:
+            inv_total_qty = inv_sum['total_qty_shipped']
+            sources = inv_sum.get('sources', {})
+            inv_item_nos = format_grouped_sources(sources, 'item_nos')
+            inv_source_row_nos = format_grouped_sources(sources, 'source_row_nos')
+            inv_source_files = ', '.join(sorted(list(sources.keys())))
+
+        rows.append({
+            'row_no': idx + 1,
+            'product_code': prod_code,
+            'pkl_item_nos': pkl_sum['pl_item_nos'] if pkl_sum else None,
+            'pkl_source_row_nos': pkl_sum['pl_source_row_nos'] if pkl_sum else None,
+            'pkl_total_qty': pkl_sum['total_qty'] if pkl_sum else None,
+            'pkl_total_net_weight': pkl_sum['total_net_w'] if pkl_sum else None,
+            'inv_item_nos': inv_item_nos if inv_sum else None,
+            'inv_source_row_nos': inv_source_row_nos if inv_sum else None,
+            'inv_total_qty': inv_total_qty if inv_sum else None,
+            'inv_source_files': inv_source_files if inv_sum else None,
+            'status': status,
+            'note': note,
+        })
 
     return pd.DataFrame(rows)
 
@@ -68,13 +125,15 @@ def build_pl_invoice_not_run_df(note: str) -> pd.DataFrame:
         [
             {
                 'row_no': None,
-                'packing_list_item_no': None,
-                'pl_source_row_no': None,
-                'inv_source_row_no': None,
-                'pl_product_code': None,
-                'inv_product_code': None,
-                'pl_qty_shipped': None,
-                'inv_qty_shipped': None,
+                'product_code': None,
+                'pkl_item_nos': None,
+                'pkl_source_row_nos': None,
+                'pkl_total_qty': None,
+                'pkl_total_net_weight': None,
+                'inv_item_nos': None,
+                'inv_source_row_nos': None,
+                'inv_total_qty': None,
+                'inv_source_files': None,
                 'status': 'NOT_RUN',
                 'note': note,
             }
@@ -148,7 +207,7 @@ def validate_packing_vs_co(
                 {
                     'product_code': product_code,
                     'co_item_no': None,
-                    'product_row_no': packing_row['product_row_nos'],
+                    'co_source_file': None,
                     'packing_list_item_no': packing_row['packing_list_item_nos'],
                     'packing_total_qty': packing_row['total_shipped_qty'],
                     'co_quantity_pieces': None,
@@ -171,7 +230,10 @@ def validate_packing_vs_co(
                         str(row.get('item_no', ''))
                         for row in matched_co_rows
                     ),
-                    'product_row_no': packing_row['product_row_nos'],
+                    'co_source_file': ', '.join(
+                        str(row.get('source_file', ''))
+                        for row in matched_co_rows
+                    ),
                     'packing_list_item_no': packing_row['packing_list_item_nos'],
                     'packing_total_qty': packing_row['total_shipped_qty'],
                     'co_quantity_pieces': None,
@@ -198,7 +260,7 @@ def validate_packing_vs_co(
                 {
                     'product_code': product_code,
                     'co_item_no': co_row.get('item_no'),
-                    'product_row_no': packing_row['product_row_nos'],
+                    'co_source_file': co_row.get('source_file'),
                     'packing_list_item_no': packing_row['packing_list_item_nos'],
                     'packing_total_qty': packing_row['total_shipped_qty'],
                     'co_quantity_pieces': co_qty,
@@ -236,7 +298,7 @@ def validate_packing_vs_co(
             {
                 'product_code': product_code,
                 'co_item_no': co_row.get('item_no'),
-                'product_row_no': packing_row['product_row_nos'],
+                'co_source_file': co_row.get('source_file'),
                 'packing_list_item_no': packing_row['packing_list_item_nos'],
                 'packing_total_qty': packing_row['total_shipped_qty'],
                 'co_quantity_pieces': co_qty,
@@ -259,7 +321,7 @@ def build_packing_vs_co_not_run_df(note: str) -> pd.DataFrame:
             {
                 'product_code': None,
                 'co_item_no': None,
-                'product_row_no': None,
+                'co_source_file': None,
                 'packing_list_item_no': None,
                 'packing_total_qty': None,
                 'co_quantity_pieces': None,

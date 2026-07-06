@@ -218,3 +218,55 @@ def extract_co_total_packages(text: str):
         return None
 
     return int(matches[-1])
+
+
+def extract_co_items_multi(
+    pdf_paths: list[tuple[str, str]],
+    decimal_separator: str = 'auto',
+) -> tuple[pd.DataFrame, int | None]:
+    """Extract CO items from multiple PDF files and combine into one DataFrame.
+
+    Args:
+        pdf_paths: list of (filename, temp_pdf_path) tuples.
+        decimal_separator: decimal separator option.
+
+    Returns:
+        A tuple of:
+          - combined co_df with an added 'source_file' column.
+          - co_total_packages: sum of total packages across all files,
+            or None if none of the files had a parseable total.
+    """
+    all_dfs: list[pd.DataFrame] = []
+    total_packages: int | None = None
+
+    for filename, pdf_path in pdf_paths:
+        text = get_pdf_text(pdf_path)
+        df = extract_co_items(text, decimal_separator=decimal_separator)
+        df['source_file'] = filename
+
+        file_packages = extract_co_total_packages(text)
+
+        if file_packages is not None:
+            total_packages = (total_packages or 0) + file_packages
+
+        all_dfs.append(df)
+
+    if not all_dfs:
+        combined = pd.DataFrame(
+            columns=[
+                'item_no',
+                'raw_item_no',
+                'item_no_repaired',
+                'raw_block',
+                'description',
+                'hs_code',
+                'quantity_pieces',
+                'net_weight_kgs',
+                'source_file',
+            ]
+        )
+    else:
+        combined = pd.concat(all_dfs, ignore_index=True)
+
+    return combined, total_packages
+

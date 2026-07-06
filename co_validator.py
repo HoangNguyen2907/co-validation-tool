@@ -26,12 +26,12 @@ from co_validator_core.ai_review import (
     build_pl_invoice_review_targets,
 )
 from co_validator_core.co_pdf import (
-    extract_co_items,
+    extract_co_items_multi,
     extract_co_total_packages,
     get_pdf_text,
 )
 from co_validator_core.constants import AI_PROVIDER_CONFIGS, AI_REVIEW_SCOPES
-from co_validator_core.excel_inputs import prepare_invoice_df, prepare_packing_df
+from co_validator_core.excel_inputs import prepare_invoice_df_multi, prepare_packing_df
 from co_validator_core.reporting import (
     add_ai_summary_row,
     build_empty_co_df,
@@ -44,7 +44,7 @@ from co_validator_core.validation import (
     build_packing_summary,
     build_packing_vs_co_not_run_df,
     build_pl_invoice_not_run_df,
-    compare_pl_invoice,
+    compare_pl_invoice_summary,
     validate_packing_vs_co,
 )
 
@@ -92,10 +92,18 @@ pl_decimal_separator_label = st.selectbox(
 
 st.subheader('Commercial Invoice Columns')
 
-invoice_file = st.file_uploader(
-    'Upload Commercial Invoice Excel',
+invoice_files = st.file_uploader(
+    'Upload Commercial Invoice Excel (up to 2 files)',
     type=['xlsx'],
+    accept_multiple_files=True,
 )
+
+if invoice_files and len(invoice_files) > 2:
+    st.warning(
+        f'Only up to 2 Invoice files are supported. '
+        f'Using the first 2 of {len(invoice_files)} uploaded files.'
+    )
+    invoice_files = invoice_files[:2]
 
 inv_product_code_header = st.text_input(
     'Invoice Product Code header',
@@ -115,10 +123,18 @@ inv_decimal_separator_label = st.selectbox(
 
 st.subheader('CO Document')
 
-co_pdf_file = st.file_uploader(
-    'Upload CO PDF',
+co_pdf_files = st.file_uploader(
+    'Upload CO PDF (up to 2 files)',
     type=['pdf'],
+    accept_multiple_files=True,
 )
+
+if co_pdf_files and len(co_pdf_files) > 2:
+    st.warning(
+        f'Only up to 2 CO files are supported. '
+        f'Using the first 2 of {len(co_pdf_files)} uploaded files.'
+    )
+    co_pdf_files = co_pdf_files[:2]
 
 co_decimal_separator_label = st.selectbox(
     'CO decimal separator',
@@ -353,7 +369,7 @@ if use_ai_audit:
             )
 
 files_ready = packing_file is not None and (
-    invoice_file is not None or co_pdf_file is not None
+    bool(invoice_files) or bool(co_pdf_files)
 )
 
 validate_clicked = st.button(
@@ -384,31 +400,31 @@ if validate_clicked:
 
         missing_files = []
 
-        if invoice_file is None:
+        if not invoice_files:
             missing_files.append('Invoice')
-            inv_df = pd.DataFrame(
-                columns=[
-                    'source_row_no',
-                    'product_code',
-                    'qty_shipped',
-                ]
-            )
-            invoice_context = {'raw_df': pd.DataFrame()}
+            invoice_map = {}
+            invoice_contexts: list[dict] = []
+            inv_row_count = 0
             pl_vs_invoice_df = build_pl_invoice_not_run_df(
                 'No Invoice available. PL vs Invoice validation was not run.'
             )
         else:
-            inv_df, invoice_context = prepare_invoice_df(
-                invoice_file,
+            invoice_map, invoice_contexts = prepare_invoice_df_multi(
+                [(f.name, f) for f in invoice_files],
                 product_code_header=inv_product_code_header,
                 qty_shipped_header=inv_qty_shipped_header,
                 decimal_separator=inv_decimal_separator,
             )
-            pl_vs_invoice_df = compare_pl_invoice(pl_df, inv_df)
+            # Total row count = sum of all data rows across all files.
+            inv_row_count = sum(
+                len(src['source_row_nos'])
+                for summary in invoice_map.values()
+                for src in summary['sources'].values()
+            )
+            pl_vs_invoice_df = compare_pl_invoice_summary(pl_df, invoice_map)
 
-        if co_pdf_file is None:
+        if not co_pdf_files:
             missing_files.append('CO')
-            co_text = ''
             co_df = build_empty_co_df()
             co_total_packages = None
             packing_vs_co_df = build_packing_vs_co_not_run_df(
@@ -418,20 +434,21 @@ if validate_clicked:
                 'No CO available. Package check was not run.'
             )
         else:
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
-                tmp.write(co_pdf_file.read())
-                co_pdf_path = tmp.name
+            co_pdf_paths = []
 
-            co_text = get_pdf_text(co_pdf_path)
-            co_df = extract_co_items(
-                co_text,
+            for co_file in co_pdf_files:
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+                    tmp.write(co_file.read())
+                    co_pdf_paths.append((co_file.name, tmp.name))
+
+            co_df, co_total_packages = extract_co_items_multi(
+                co_pdf_paths,
                 decimal_separator=co_decimal_separator,
             )
-            co_total_packages = extract_co_total_packages(co_text)
 
         packing_summary_df = build_packing_summary(pl_df)
 
-        if co_pdf_file is not None:
+        if co_pdf_files:
             packing_vs_co_df = validate_packing_vs_co(
                 packing_summary_df,
                 co_df,
@@ -454,18 +471,20 @@ if validate_clicked:
                 pl_invoice_targets = build_pl_invoice_review_targets(
                     pl_vs_invoice_df,
                     packing_context,
-                    invoice_context,
+                    invoice_contexts,
                 )
 
             if (
-                co_pdf_file is not None
+                co_pdf_files
                 and ai_document_scope in [
                     'PL vs Invoice + Packing vs CO',
                     'Packing vs CO only',
                 ]
             ):
+                # Use text from the first CO file for snippet lookup.
+                co_text_for_ai = get_pdf_text(co_pdf_paths[0][1]) if co_pdf_paths else ''
                 packing_co_targets = build_packing_co_review_targets(
-                    co_text,
+                    co_text_for_ai,
                     co_df,
                     packing_context,
                     packing_summary_df,
@@ -496,7 +515,7 @@ if validate_clicked:
 
         summary_df = build_summary(
             pl_df,
-            inv_df,
+            inv_row_count,
             co_df,
             pl_vs_invoice_df,
             packing_vs_co_df,
@@ -538,9 +557,6 @@ if validate_clicked:
 
     st.subheader('PL vs Invoice')
     st.dataframe(pl_vs_invoice_df, hide_index=True, width='stretch')
-
-    st.subheader('Packing Summary')
-    st.dataframe(packing_summary_df, hide_index=True, width='stretch')
 
     st.subheader('Packing vs CO')
     st.dataframe(packing_vs_co_df, hide_index=True, width='stretch')
